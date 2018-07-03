@@ -1,0 +1,399 @@
+Volley 源码解析：
+
+该文章会从Volley主要流程分析Volley的大致步骤，以及结构划分。
+
+阅读本文前提知道volley基本使用方法。
+
+本文目录如下：
+
+1 .  主要流程
+
+2 .  如何请求
+
+3 .  如何缓存
+
+4 .  如何解析
+
+5 .  如何分发结果
+
+6 .  如何加载图片
+
+7 .  主要类分析
+
+
+
+###   首先思考几个问题
+
+volley是如何做到线程切换的？如何保证所有线程分发都会到主线程？
+
+ volley的工作流程是怎样的？
+
+ 如果不是使用volley，android原生提供网络访问有哪些方式？
+
+ volley的缓存机制如何实现的？
+
+ volley允许最大的并发是怎样，最后怎么保证正确分发结果的？
+
+ 如果是两个相同的请求请求过来，volley会如何处理？
+
+ 描述volley中请求的的关键类作用？
+
+ volley 如何实现分类取消的根据tag?
+
+ HttpClient ? HttpUrlConnection? 的区别？ 
+
+
+
+
+
+这里面的问题都能回答上吗？如果不能跟随我来看看Volley是如何做的。
+
+
+
+从最开始Volley.newRequestQueue(Context context)
+
+如果默认使用Volley.newRequestQueue(Context context) 构造函数是没有提供网络栈实现的。
+
+> ```
+> if (stack == null) {
+> //大于android 9.0 则使用HurlStack 
+> if (Build.VERSION.SDK_INT >= 9) {
+>         network = new BasicNetwork(new HurlStack());
+>     }
+>     //小于android 9.0使用HttpClientStack ,并且设置uuserAgent 为Volley/0/packagename/Androidmanifest 中申明的versionCode
+>     else {
+>         // Prior to Gingerbread, HttpUrlConnection was unreliable.
+>         // See: http://android-developers.blogspot.com/2011/09/androids-http-clients.html
+>         // At some point in the future we'll move our minSdkVersion past Froyo and can
+>         // delete this fallback (along with all Apache HTTP code).
+>         String userAgent = "volley/0";
+>         try {
+>             String packageName = context.getPackageName();
+>             PackageInfo info = context.getPackageManager().getPackageInfo(packageName, 0);
+>             userAgent = packageName + "/" + info.versionCode;
+>         } catch (NameNotFoundException e) {
+>         }
+>         
+>         network = new BasicNetwork(
+>                 new HttpClientStack(AndroidHttpClient.newInstance(userAgent)));
+>     }
+> }
+> //如果有提供网络栈则使用该网络栈
+> else {
+>     network = new BasicNetwork(stack);
+> }
+> //返回requestQueue 构造函数是上面创建的network 
+> return newRequestQueue(context, network);
+> ```
+
+看到这里是不是很懵逼：HttpClientStack是什么？BasicNetWorkd 又是什么？HurlStack 是什么？ 
+
+别急，待会会一一讲解。
+
+最终该构造函数构建了一个RequestQueue 队列。
+
+> ```
+> private static RequestQueue newRequestQueue(Context context, Network network) {
+>     //设置缓存路径
+>     File cacheDir = new File(context.getCacheDir(), DEFAULT_CACHE_DIR);
+>     //设置好网络和缓存
+>     RequestQueue queue = new RequestQueue(new DiskBasedCache(cacheDir), network);
+>     //让工作队列开始启动起来
+>     queue.start();
+>     //返回该队列
+>     return queue;
+> }
+> ```
+
+小结：volley工具类中主要维护的就是一个请求队列，该队列由网络和缓存这两个部分组成。
+
+我们看看RequestQueue.start()  方法都做了些什么：
+
+> ```
+> public void start() {
+>     //首先停止掉CacheDispatcher 和 NetworkDispatcher,CacheDispatcher 只有一个，但是网络Dispatcher 有多个。 
+>     stop();  // Make sure any currently running dispatchers are stopped.
+>     // Create the cache dispatcher and start it.
+>     //创建一个新的CacheDispatcher 
+>     mCacheDispatcher = new CacheDispatcher(mCacheQueue, mNetworkQueue, mCache, mDelivery);
+>     //启动该CacheDispatcher 
+>     mCacheDispatcher.start();
+> 
+>     // Create network dispatchers (and corresponding threads) up to the pool size.
+>     //新建Network dispatchers 并且启动NetworkDispatcher
+>     for (int i = 0; i < mDispatchers.length; i++) {
+>         NetworkDispatcher networkDispatcher = new NetworkDispatcher(mNetworkQueue, mNetwork,
+>                 mCache, mDelivery);
+>         mDispatchers[i] = networkDispatcher;
+>         networkDispatcher.start();
+>     }
+> }
+> ```
+
+看到上面代码有个疑问，为何只初始化了一个CacheDispatcher 但是却初始化了多个Networkdispatcher呢？
+
+在来看看启动的CacheDispatcher 和NetworkDispatcher 分别是干什么用的。Dispatcher 中文含义是调度员的意思。
+
+那大致说明CacheDispatcher 是缓存调度员，NetworkDispatcher 是网络调度员。
+
+现在来看看这个调度员究竟干了些什么事。
+
+> ```
+> CacheDispatcher 继承了线程，并且通过类的说明来说，该线程是用来处理缓存调度的，如果有缓存则通过ResponseDelivery分发给调用的Listener 如果没有缓存或者是缓存过期则将则将请求添加到network queue中。
+> public class CacheDispatcher extends Thread  
+> ```
+
+接下来看看CacheDispatcher 中的run方法：
+
+```
+    @Override
+    public void run() {
+        if (DEBUG) VolleyLog.v("start new dispatcher");
+        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+
+        // Make a blocking call to initialize the cache.
+        //初始化缓存，最终调用的是DiskBaseCache 中的initialize() 方法。
+        // 该类读取缓存文件夹中的所有缓存，并且初始化缓存头map。
+        mCache.initialize();
+        //不断的处理请求
+        while (true) {
+            try {
+                processRequest();
+            } catch (InterruptedException e) {
+                // We may have been interrupted because it was time to quit.
+                //如果已经quit掉，则跳出run方法不在执行
+                if (mQuit) {
+                    return;
+                }
+            }
+        }
+    }
+```
+
+所以上面的CacheDispatcher 中主要处理请求的再CacheDisPatcher中。
+
+```
+来看看关键代码，代码经过删除。 
+private void processRequest() throws InterruptedException {
+        // Get a request from the cache triage queue, blocking until
+        // at least one is available.
+        //从缓存队列中取出请求
+        final Request<?> request = mCacheQueue.take();
+        
+        //尝试获取该请求对应的缓存，该缓存的key是请求的url
+        // Attempt to retrieve this item from cache.
+        Cache.Entry entry = mCache.get(request.getCacheKey());
+        //如果缓存丢失，则将请求添加到网络队列中
+        if (entry == null) {
+            // Cache miss; send off to the network dispatcher.
+            if (!mWaitingRequestManager.maybeAddToWaitingRequests(request)) {
+                mNetworkQueue.put(request);
+            }
+            return;
+        }
+
+        // If it is completely expired, just send it to the network.
+        //判读缓存是否过期
+        if (entry.isExpired()) {
+             //判断是否已经在请求中，如果没有则添加到网络请求队列中
+            if (!mWaitingRequestManager.maybeAddToWaitingRequests(request)) {
+                mNetworkQueue.put(request);
+            }
+            return;
+        }
+
+        // 如果缓存命中则将缓存数据解析成对应的response
+        Response<?> response = request.parseNetworkResponse(
+                new NetworkResponse(entry.data, entry.responseHeaders));
+        //如果缓存不需要刷新，则直接通过mDeliver最后是通过主线程的Handler回调Request中的Listener      
+        if (!entry.refreshNeeded()) {
+            // Completely unexpired cache hit. Just deliver the response.
+            mDelivery.postResponse(request, response);
+        } else {
+            //如果缓存命中但是需要刷新，标记该response为中间结果
+            response.intermediate = true;
+            //如果没有添加到网络请求队列中
+            if (!mWaitingRequestManager.maybeAddToWaitingRequests(request)) {
+               //先将结果给回调，然后请求网络
+               mDelivery.postResponse(request, response, new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            mNetworkQueue.put(request);
+                        } catch (InterruptedException e) {
+                            // Restore the interrupted status
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                });
+            } else {
+               // 如果结果已经添加到请求队列中则直接返回结果，不再进行网络请求
+                mDelivery.postResponse(request, response);
+            }
+        }
+    }
+```
+
+总结：CacheDispatcher 的主要作用是在通过缓存中取出缓存的网络数据，传递给Deliver然后将数据最终回传给Listener ，如果缓存不存在或者是不新鲜则将请求最终添加到NetworkQueue 中。
+
+接下来看NetworkDispatcher 
+
+``` 
+NetworkDispatcher 同样也是继承自线程。来看看run方法做了些什么。
+  @Override
+    public void run() {
+        //设置线程优先级
+        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+        while (true) {
+            try {
+                //循环的处理结果
+                processRequest();
+            } catch (InterruptedException e) {
+            }
+        }
+    }
+```
+
+```
+再来看看processRequest 中做了些什么。只保留了主要代码
+private void processRequest() throws InterruptedException {
+        long startTimeMs = SystemClock.elapsedRealtime();
+        // Take a request from the queue.
+        Request<?> request = mQueue.take();
+
+        try {
+            //如果该请求已经被取消了，则直接finish request  
+            if (request.isCanceled()) {
+                request.finish("network-discard-cancelled");
+                request.notifyListenerResponseNotUsable();
+                return;
+            }
+            //设置网络状态的统计配置
+            addTrafficStatsTag(request);
+        
+            //执行网络请求
+            NetworkResponse networkResponse = mNetwork.performRequest(request);
+            request.addMarker("network-http-complete");
+            //如果服务器返回304 代表数据还是有效的没有更新过，如果结果已经分发过了，则直接结束掉该请求
+            if (networkResponse.notModified && request.hasHadResponseDelivered()) {
+                request.finish("not-modified");
+                request.notifyListenerResponseNotUsable();
+                return;
+            }
+            //解析networkResponse 
+            Response<?> response = request.parseNetworkResponse(networkResponse);                                     			  request.addMarker("network-parse-complete");
+
+            //如果该请求可以缓存则将该请求的结果缓存起来
+            if (request.shouldCache() && response.cacheEntry != null) {
+                mCache.put(request.getCacheKey(), response.cacheEntry);
+                request.addMarker("network-cache-written");
+            }
+            //交给deliver 分发最终请求到的response
+            mDelivery.postResponse(request, response);
+            request.notifyListenerResponseReceived(response);
+        } catch (VolleyError volleyError) {
+           
+        } catch (Exception e) {
+           
+        }
+    }
+```
+
+来看看RequestQueue中是如何添加请求的：
+
+```
+
+    public <T> Request<T> add(Request<T> request) {
+      
+        //将请求添加到Request中的Set集合中，该结合代表RequestQueue中正在处理的请求，如果请求完毕会set中删除掉
+        synchronized (mCurrentRequests) {
+            mCurrentRequests.add(request);
+        }
+         
+        //如果该该请求不应该缓存，则直接将该请求添加到网络队列中      
+        if (!request.shouldCache()) {
+            mNetworkQueue.add(request);
+            return request;
+        }
+        //如果支持缓存则同时将请求添加到mCacheQueue中
+        mCacheQueue.add(request);
+        return request;
+     }
+
+```
+
+​    接着回到NetworkDispatcher中查看网络请求是如何发送出来的。
+
+```
+//这一句话执行网络请求  
+NetworkResponse networkResponse = mNetwork.performRequest(request);      
+```
+
+看看mNetwork 是什么，又是怎么执行的。
+
+这里的Network 是Volley中构建newRequestQueue() 方法构建出来的。
+
+```
+mNetwork 是BasicNetwork Volley 对BasicNetwork 的解释是，通过Httpstck 进行网络请求。
+```
+
+在android 9.0 以上是通过HurlStack 来实现的。android 9.0 一下是通过 HttpClientStack
+
+先看看HurlStack 的代码。整个请求是通过调用HurlStack 中的excuteReqeust 方法进行的。来看看excuteReqeust 方法。
+
+```
+    @Override
+    public HttpResponse executeRequest(Request<?> request, Map<String, String> additionalHeaders)
+            throws IOException, AuthFailureError {
+        String url = request.getUrl();
+        HashMap<String, String> map = new HashMap<>();
+        //存放缓存头
+        map.putAll(request.getHeaders());
+        map.putAll(additionalHeaders);
+        // 如果设置UrlRewriter则重写请求url
+        if (mUrlRewriter != null) {
+            String rewritten = mUrlRewriter.rewriteUrl(url);
+            if (rewritten == null) {
+                throw new IOException("URL blocked by rewriter: " + url);
+            }
+            url = rewritten;
+        }
+        
+        URL parsedUrl = new URL(url);
+        //打开一个连接
+        HttpURLConnection connection = openConnection(parsedUrl, request);
+        //设置请求头
+        for (String headerName : map.keySet()) {
+            connection.addRequestProperty(headerName, map.get(headerName));
+        }
+        //设置请求方法
+        setConnectionParametersForRequest(connection, request);
+      
+        //返回最终请求成功的HttpResponse 
+        return new HttpResponse(responseCode, convertHeaders(connection.getHeaderFields()),
+                connection.getContentLength(), inputStreamFromConnection(connection));
+    }
+```
+
+小结：最终查看发起网络请求都是通过UrlConnection来进行数据发送的。
+
+看到这里整个volley库的大致流程算是弄清楚了。
+
+现在开始回答上文中提到的几个问题：
+
+1  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
