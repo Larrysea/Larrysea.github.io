@@ -1,1 +1,1 @@
-Sea 的博客记录project.
+Sea 的博客记录文件夹。
